@@ -1,0 +1,24 @@
+# Large binary DAT recordings (hundreds of MB each)
+*.dat
+
+# Compiled / build artifacts
+ECGViewer/build/
+ECGViewer/dist/
+HelloQt/build/
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test data
+test.csv
+
+# OS
+Thumbs.db
+.DS_Store
