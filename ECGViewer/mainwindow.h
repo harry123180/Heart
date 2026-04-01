@@ -5,6 +5,7 @@
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QFutureWatcher>
+#include <QDoubleSpinBox>
 #include "dr200parser.h"
 #include "ecgview_canvas.h"
 #include "spectrumview.h"
@@ -18,6 +19,7 @@ public:
 private slots:
     void openFile();
     void exportCsv();
+    void exportRangeCsv();
     void onFileLoaded();           // called when background parse finishes
     void onChannelChanged(int ch);
     void onViewChanged(double xMin, double xMax);
@@ -55,6 +57,10 @@ private:
     EcgViewCanvas* m_ecgView;
     SpectrumView* m_specView;
     QTableWidget* m_table;
+
+    // ── range export ──
+    QDoubleSpinBox* m_spinRangeStart = nullptr;
+    QDoubleSpinBox* m_spinRangeEnd   = nullptr;
 
     // ── status ──
     QLabel* m_statusLeft;

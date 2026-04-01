@@ -1,13 +1,33 @@
 #include "dr200parser.h"
 #include <QFile>
+#include <QDir>
+#include <QProcess>
+#include <QTemporaryFile>
+#include <QCoreApplication>
 #include <QTextStream>
 #include <algorithm>
+#include <cstdint>
+
+// ─── Locate unpackdc.exe ──────────────────────────────────────────────────────
+
+QString DR200Parser::findUnpackdc() {
+    QStringList candidates = {
+        R"(C:\nm\bin\unpackdc.exe)",
+        QCoreApplication::applicationDirPath() + "/unpackdc.exe",
+        QCoreApplication::applicationDirPath() + "/../nm/bin/unpackdc.exe",
+    };
+    for (const QString& p : candidates) {
+        if (QFile::exists(p)) return p;
+    }
+    return {};
+}
 
 // ─── public entry point ───────────────────────────────────────────────────────
 
 ECGData DR200Parser::parse(const QString& filepath) {
     ECGData out;
 
+    // --- Step 1: open & validate file ---
     QFile f(filepath);
     if (!f.open(QIODevice::ReadOnly)) {
         out.errorMsg = "Cannot open file: " + filepath;
@@ -22,70 +42,146 @@ ECGData DR200Parser::parse(const QString& filepath) {
         return out;
     }
 
-    // BUG FIX #2: parse only blocks 0-2 for config (not 0-3)
+    // --- Step 2: parse config (blocks 0-2) ---
     parseConfig(raw, out);
-
     out.sampleRate  = out.rawConfig.value("SampleRate", "180").toDouble();
-    out.numChannels = out.rawConfig.value("SampleStorageFormat", "1").toInt();
-    if (out.numChannels < 1 || out.numChannels > 8) out.numChannels = 1;
+    out.numChannels = 1; // DR200/HE: single ECG channel
 
-    // BUG FIX #3: efficient data bounds scan — stop after MAX_ZERO_BLOCKS consecutive zeros
+    // --- Step 3: find valid data range ---
     int lastBlock = findLastDataBlock(raw);
     if (lastBlock < 3) {
-        // Empty recording: config is present but no ECG data was written.
-        // Return valid with zero channels so the viewer can show metadata.
         out.numBlocks    = 0;
         out.totalSamples = 0;
         out.durationSec  = 0.0;
-        out.numChannels  = qMax(1, out.numChannels);
-        out.channels_uv.resize(out.numChannels);
-        out.leadOff.resize(out.numChannels);
+        out.channels_uv.resize(1);
+        out.leadOff.resize(1);
         out.rawConfig["_filepath"] = filepath;
         out.valid = true;
         return out;
     }
     out.numBlocks = lastBlock - 3 + 1;
 
-    // Collect raw ECG bytes (first ECG_BYTES per block only — diary region excluded)
-    QByteArray ecgRaw;
-    ecgRaw.reserve(out.numBlocks * ECG_BYTES);
-    for (int bi = 3; bi <= lastBlock; bi++) {
-        int off = bi * BLOCK_SIZE + DATA_OFFSET;
-        ecgRaw.append(raw.constData() + off, ECG_BYTES);
+    // --- Step 4: write truncated copy to temp (unpackdc ERASES its input) ---
+    QString unpackdc = findUnpackdc();
+    if (unpackdc.isEmpty()) {
+        out.errorMsg = "unpackdc.exe not found. Place it at C:\\nm\\bin\\unpackdc.exe";
+        return out;
     }
 
-    // Decode 12-bit LE packed samples
-    QVector<int32_t> adcVals = decode12bitLE(
-        reinterpret_cast<const uint8_t*>(ecgRaw.constData()), ecgRaw.size());
+    QTemporaryFile tmpDat;
+    tmpDat.setFileTemplate(QDir::tempPath() + "/flash_XXXXXX.dat");
+    if (!tmpDat.open()) {
+        out.errorMsg = "Cannot create temp file";
+        return out;
+    }
+    int validBytes = (lastBlock + 1) * BLOCK_SIZE;
+    tmpDat.write(raw.constData(), validBytes);
+    tmpDat.close(); // flush, but keep file (setAutoRemove is true by default)
 
-    int nCh  = out.numChannels;
-    int nTot = adcVals.size();
-    // Trim to multiple of nCh
-    nTot = (nTot / nCh) * nCh;
+    QString tmpPath = tmpDat.fileName();
 
-    out.totalSamples = nTot / nCh;
-    out.durationSec  = out.totalSamples / out.sampleRate;
+    // --- Step 5: run unpackdc on the temp copy ---
+    QString ch0Path = QDir::tempPath() + "/ecg_ch0.ibf";
+    QString ch1Path = QDir::tempPath() + "/ecg_ch1.ibf";
+    QString ch2Path = QDir::tempPath() + "/ecg_ch2.ibf";
 
-    // Allocate channels
-    out.channels_uv.resize(nCh);
-    out.leadOff.resize(nCh);
-    for (int ch = 0; ch < nCh; ch++) {
-        out.channels_uv[ch].resize(out.totalSamples);
-        out.leadOff[ch].resize(out.totalSamples);
+    // Remove old IBF files if present
+    QFile::remove(ch0Path);
+    QFile::remove(ch1Path);
+    QFile::remove(ch2Path);
+
+    QProcess proc;
+    proc.start(unpackdc, {tmpPath, ch0Path, ch1Path, ch2Path, "0"});
+    if (!proc.waitForFinished(120000)) {
+        out.errorMsg = "unpackdc timed out";
+        return out;
+    }
+    if (proc.exitCode() != 0) {
+        out.errorMsg = QString("unpackdc failed (exit %1)").arg(proc.exitCode());
+        return out;
     }
 
-    // De-interleave and convert
-    // Samples are stored: ch0, ch1, ..., ch(N-1), ch0, ch1, ...
-    for (int sample = 0; sample < out.totalSamples; sample++) {
-        for (int ch = 0; ch < nCh; ch++) {
-            int32_t adc = adcVals[sample * nCh + ch];
-            out.leadOff[ch][sample]    = (adc == LEAD_OFF_ADC);
-            out.channels_uv[ch][sample] = (float)((adc - ADC_CENTER) * UV_PER_LSB);
+    // --- Step 6: read IBF ch0 (int16 LE) ---
+    QFile ibf0(ch0Path);
+    if (!ibf0.open(QIODevice::ReadOnly) || ibf0.size() == 0) {
+        out.errorMsg = "IBF ch0 empty or missing after unpackdc";
+        return out;
+    }
+    QByteArray ibfRaw = ibf0.read(out.numBlocks * 400 * 2 + 4096); // generous read
+    ibf0.close();
+
+    int nSamples = ibfRaw.size() / 2; // int16 = 2 bytes each
+    const int16_t* ibfData = reinterpret_cast<const int16_t*>(ibfRaw.constData());
+
+    // --- Step 7: convert int16 -> float uV, mark lead-off ---
+    QVector<float> raw_uv(nSamples);
+    QVector<bool>  lo(nSamples, false);
+
+    for (int i = 0; i < nSamples; i++) {
+        int16_t v = ibfData[i];
+        if (v == (int16_t)IBF_LEAD_OFF) {
+            lo[i]     = true;
+            raw_uv[i] = 0.0f; // placeholder; display will skip these
+        } else {
+            raw_uv[i] = (float)(v * IBF_UV_PER_LSB);
         }
     }
 
-    out.rawConfig["_filepath"] = filepath;
+    // --- Step 8: high-pass filter (remove DC electrode polarization) ---
+    // Window = 1 second = sampleRate samples
+    int hpWindow = (int)out.sampleRate;
+    QVector<float> hp_uv = hpFilter(raw_uv, hpWindow);
+
+    // Zero out lead-off positions in filtered signal
+    for (int i = 0; i < nSamples; i++) {
+        if (lo[i]) hp_uv[i] = 0.0f;
+    }
+
+    // --- Step 9: populate ECGData ---
+    out.totalSamples = nSamples;
+    out.durationSec  = nSamples / out.sampleRate;
+    out.channels_uv.resize(1);
+    out.leadOff.resize(1);
+    out.channels_uv[0] = hp_uv;
+    out.leadOff[0]     = lo;
+
+    out.rawConfig["_filepath"]  = filepath;
+    out.rawConfig["_ibf_path"]  = ch0Path;
+    out.rawConfig["_ibf_samples"] = QString::number(nSamples);
     out.valid = true;
+    return out;
+}
+
+// ─── high-pass filter ─────────────────────────────────────────────────────────
+
+QVector<float> DR200Parser::hpFilter(const QVector<float>& in, int windowSamples) {
+    int n = in.size();
+    QVector<float> out(n, 0.0f);
+    if (n == 0) return out;
+
+    // O(n) sliding-window boxcar HP filter (centred, symmetric)
+    // LP = running mean over [-half, +half]; HP = signal - LP
+    int half = windowSamples / 2;
+    double winSum = 0.0;
+    int    winCnt = 0;
+
+    // Pre-load the first [0, half] samples into the window
+    for (int i = 0; i <= std::min(half, n - 1); i++) {
+        winSum += in[i];
+        winCnt++;
+    }
+
+    for (int i = 0; i < n; i++) {
+        // Advance right edge of window
+        int addIdx = i + half + 1;
+        if (addIdx < n) { winSum += in[addIdx]; winCnt++; }
+
+        // Retire left edge of window
+        int removeIdx = i - half;
+        if (removeIdx > 0) { winSum -= in[removeIdx - 1]; winCnt--; }
+
+        out[i] = (winCnt > 0) ? in[i] - (float)(winSum / winCnt) : 0.0f;
+    }
     return out;
 }
 
@@ -93,12 +189,10 @@ ECGData DR200Parser::parse(const QString& filepath) {
 
 void DR200Parser::parseConfig(const QByteArray& raw, ECGData& out) {
     QString text;
-    // Only blocks 0, 1, 2 are config
     for (int bi = 0; bi < 3; bi++) {
-        int off = bi * BLOCK_SIZE + 4; // skip 4-byte magic
+        int off = bi * BLOCK_SIZE + 4;
         int len = BLOCK_SIZE - 8;
         const char* ptr = raw.constData() + off;
-        // read up to null terminator
         int nullPos = -1;
         for (int i = 0; i < len; i++) {
             if (ptr[i] == 0) { nullPos = i; break; }
@@ -113,9 +207,7 @@ void DR200Parser::parseConfig(const QByteArray& raw, ECGData& out) {
         QString l = line.trimmed().remove('\r');
         int eq = l.indexOf('=');
         if (eq > 0) {
-            QString key = l.left(eq).trimmed();
-            QString val = l.mid(eq + 1).trimmed();
-            out.rawConfig[key] = val;
+            out.rawConfig[l.left(eq).trimmed()] = l.mid(eq + 1).trimmed();
         }
     }
 
@@ -134,43 +226,33 @@ void DR200Parser::parseConfig(const QByteArray& raw, ECGData& out) {
 
 int DR200Parser::findLastDataBlock(const QByteArray& raw) {
     int totalBlocks = raw.size() / BLOCK_SIZE;
-    int lastActive  = 2; // will be updated if any data block found
-    int zeroStreak  = 0;
+    int lastActive  = 2;
+    uint32_t prevCounter = 0;
 
     for (int bi = 3; bi < totalBlocks; bi++) {
-        int off = bi * BLOCK_SIZE + DATA_OFFSET;
-        const char* ptr = raw.constData() + off;
+        const uint8_t* blk = reinterpret_cast<const uint8_t*>(raw.constData()) + bi * BLOCK_SIZE;
 
-        bool hasData = false;
-        for (int i = 0; i < ECG_BYTES; i++) {
-            if (ptr[i] != 0) { hasData = true; break; }
-        }
+        // Validate block magic: must be 00 02 00 00 1E 00
+        if (blk[0] != 0x00 || blk[1] != 0x02 || blk[2] != 0x00 || blk[3] != 0x00 ||
+            blk[4] != 0x1E || blk[5] != 0x00)
+            break;
 
-        if (hasData) {
-            lastActive = bi;
-            zeroStreak = 0;
+        uint32_t counter = static_cast<uint32_t>(blk[6])
+                         | (static_cast<uint32_t>(blk[7]) << 8)
+                         | (static_cast<uint32_t>(blk[8]) << 16)
+                         | (static_cast<uint32_t>(blk[9]) << 24);
+
+        if (bi == 3) {
+            // Accept any starting counter value (firmware version may differ)
+            prevCounter = counter;
         } else {
-            zeroStreak++;
-            // BUG FIX #3: stop early after consecutive zero blocks
-            if (zeroStreak >= MAX_ZERO_BLOCKS) break;
+            // Counter must increment by exactly 1216 each block
+            if (counter != prevCounter + 1216)
+                break;
+            prevCounter = counter;
         }
+
+        lastActive = bi;
     }
     return lastActive;
-}
-
-// ─── 12-bit LE decoder ────────────────────────────────────────────────────────
-
-QVector<int32_t> DR200Parser::decode12bitLE(const uint8_t* buf, int byteCount) {
-    int pairs = (byteCount / 3);
-    QVector<int32_t> out;
-    out.reserve(pairs * 2);
-
-    for (int i = 0; i < pairs; i++) {
-        uint8_t b0 = buf[i * 3 + 0];
-        uint8_t b1 = buf[i * 3 + 1];
-        uint8_t b2 = buf[i * 3 + 2];
-        out.append((int32_t)(b0 | ((b1 & 0x0F) << 8)));
-        out.append((int32_t)((b1 >> 4) | (b2 << 4)));
-    }
-    return out;
 }

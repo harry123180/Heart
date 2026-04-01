@@ -114,11 +114,41 @@ void MainWindow::setupUi() {
     lv->addWidget(gbDisp);
 
     // 匯出按鈕
-    auto btnExp = new QPushButton("匯出 CSV");
+    auto btnExp = new QPushButton("匯出 CSV（全部）");
     btnExp->setFixedHeight(30);
     connect(btnExp, &QPushButton::clicked, this, &MainWindow::exportCsv);
     lv->addWidget(btnExp);
 
+    // 區間匯出群組
+    QGroupBox* gbRange = new QGroupBox("區間選擇");
+    QVBoxLayout* rv = new QVBoxLayout(gbRange);
+    rv->setContentsMargins(6,14,6,6); rv->setSpacing(5);
+
+    QFormLayout* rf = new QFormLayout;
+    rf->setSpacing(3);
+    m_spinRangeStart = new QDoubleSpinBox;
+    m_spinRangeStart->setRange(0, 99999); m_spinRangeStart->setDecimals(2);
+    m_spinRangeStart->setSuffix(" 秒"); m_spinRangeStart->setValue(0);
+    m_spinRangeEnd = new QDoubleSpinBox;
+    m_spinRangeEnd->setRange(0, 99999); m_spinRangeEnd->setDecimals(2);
+    m_spinRangeEnd->setSuffix(" 秒"); m_spinRangeEnd->setValue(10);
+    rf->addRow("起始：", m_spinRangeStart);
+    rf->addRow("結束：", m_spinRangeEnd);
+    rv->addLayout(rf);
+
+    auto btnJump = new QPushButton("跳至此區間");
+    btnJump->setFixedHeight(26);
+    connect(btnJump, &QPushButton::clicked, this, [this]{
+        m_ecgView->setViewRange(m_spinRangeStart->value(), m_spinRangeEnd->value());
+    });
+    rv->addWidget(btnJump);
+
+    auto btnRangeExp = new QPushButton("匯出此區間 CSV");
+    btnRangeExp->setFixedHeight(26);
+    connect(btnRangeExp, &QPushButton::clicked, this, &MainWindow::exportRangeCsv);
+    rv->addWidget(btnRangeExp);
+
+    lv->addWidget(gbRange);
     lv->addStretch();
 
     // ── 主要分頁 ──
@@ -288,8 +318,10 @@ void MainWindow::updateInfoPanel() {
     m_lblDuration->setText(QString("%1 秒（%2 分）")
                                .arg(d.durationSec,0,'f',1).arg(d.durationSec/60,0,'f',2));
     m_lblSamples->setText(QString::number(d.totalSamples));
-    m_lblChannels->setText(QString("%1 通道 @ %2 Hz")
-                               .arg(d.numChannels).arg(d.sampleRate,0,'f',0));
+    m_lblChannels->setText(QString("%1 通道 @ %2 Hz  [fmt:%3]")
+                               .arg(d.numChannels)
+                               .arg(d.sampleRate,0,'f',0)
+                               .arg(d.rawConfig.value("SampleStorageFormat","?")));
 
     if (!d.leadOff.isEmpty() && !d.leadOff[0].isEmpty()) {
         int lo = (int)std::count(d.leadOff[0].constBegin(), d.leadOff[0].constEnd(), true);
@@ -313,6 +345,15 @@ void MainWindow::onViewChanged(double xMin, double xMax) {
     m_statusRight->setText(
         QString("視圖：%1 \u2013 %2 秒  |  範圍：%3 秒")
             .arg(xMin,0,'f',2).arg(xMax,0,'f',2).arg(xMax-xMin,0,'f',2));
+    // sync spinboxes to current view
+    if (m_spinRangeStart && m_spinRangeEnd) {
+        m_spinRangeStart->blockSignals(true);
+        m_spinRangeEnd->blockSignals(true);
+        m_spinRangeStart->setValue(xMin);
+        m_spinRangeEnd->setValue(xMax);
+        m_spinRangeStart->blockSignals(false);
+        m_spinRangeEnd->blockSignals(false);
+    }
 }
 
 void MainWindow::onSampleHovered(double t, double uv, bool onSig) {
@@ -368,6 +409,74 @@ void MainWindow::fillTable() {
     m_table->resizeColumnsToContents();
 }
 
+// ─── 區間 CSV 匯出 ────────────────────────────────────────────────────────────
+
+void MainWindow::exportRangeCsv() {
+    if (!m_ecg.valid) {
+        QMessageBox::information(this, "匯出", "尚未載入資料。");
+        return;
+    }
+
+    double t0 = m_spinRangeStart->value();
+    double t1 = m_spinRangeEnd->value();
+    if (t0 >= t1) {
+        QMessageBox::warning(this, "區間錯誤", "結束時間必須大於起始時間。");
+        return;
+    }
+
+    QString path = QFileDialog::getSaveFileName(
+        this, "匯出區間 CSV", QString(), "CSV 檔案 (*.csv)");
+    if (path.isEmpty()) return;
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::critical(this, "錯誤", "無法寫入：" + path);
+        return;
+    }
+
+    double sr = m_ecg.sampleRate;
+    int iStart = qMax(0,            (int)(t0 * sr));
+    int iEnd   = qMin(m_ecg.totalSamples - 1, (int)(t1 * sr));
+
+    file.write("\xEF\xBB\xBF"); // UTF-8 BOM for Excel
+    QTextStream out(&file);
+    out.setCodec("UTF-8");
+    out << QString::fromUtf8("# DR200/HE 區間匯出\n")
+        << QString::fromUtf8("# 病患：") << m_ecg.patientId << "\n"
+        << QString::fromUtf8("# 日期：") << m_ecg.startDate << " " << m_ecg.startTime << "\n"
+        << QString::fromUtf8("# 區間：") << t0 << " ~ " << t1 << QString::fromUtf8(" 秒\n")
+        << QString::fromUtf8("# 取樣率：") << sr << " Hz\n#\n";
+
+    out << QString::fromUtf8("索引,時間(秒)");
+    for (int ch = 0; ch < m_ecg.numChannels; ch++)
+        out << QString(",通道%1微伏,通道%1毫伏,通道%1電極脫落").arg(ch);
+    out << "\n";
+
+    int n = iEnd - iStart + 1;
+    QProgressDialog prog("匯出區間中...", "取消", 0, n, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setWindowTitle("匯出區間 CSV");
+
+    for (int i = iStart; i <= iEnd; i++) {
+        int row = i - iStart;
+        if (row % 5000 == 0) { prog.setValue(row); qApp->processEvents(); }
+        if (prog.wasCanceled()) break;
+        out << i << "," << QString::number((double)i / sr, 'f', 5);
+        for (int ch = 0; ch < m_ecg.numChannels; ch++) {
+            bool lf = (i < m_ecg.leadOff[ch].size()) && m_ecg.leadOff[ch][i];
+            float uv = m_ecg.channels_uv[ch][i];
+            if (lf) out << ",,,1";
+            else out << "," << QString::number(uv, 'f', 2)
+                     << "," << QString::number(uv / 1000, 'f', 5) << ",0";
+        }
+        out << "\n";
+    }
+    prog.setValue(n);
+    QMessageBox::information(this, "匯出完成",
+        QString("已匯出 %1 筆資料（%2 ~ %3 秒）至：\n%4")
+            .arg(n).arg(t0, 0, 'f', 2).arg(t1, 0, 'f', 2).arg(path));
+}
+
 // ─── CSV 匯出 ─────────────────────────────────────────────────────────────────
 
 void MainWindow::exportCsv() {
@@ -386,16 +495,18 @@ void MainWindow::exportCsv() {
         return;
     }
 
+    file.write("\xEF\xBB\xBF"); // UTF-8 BOM for Excel
     QTextStream out(&file);
-    out << "# DR200/HE Holter 心電圖匯出\n"
-        << "# 病患：" << m_ecg.patientId << "\n"
-        << "# 日期：" << m_ecg.startDate << " " << m_ecg.startTime << "\n"
-        << "# 序號：" << m_ecg.serialNumber << " " << m_ecg.firmware << "\n"
-        << "# 取樣率：" << m_ecg.sampleRate << " Hz\n"
-        << "# 通道數：" << m_ecg.numChannels << "\n"
-        << "# 比例：12.5 uV/LSB，ADC 中心值 2048\n#\n";
+    out.setCodec("UTF-8");
+    out << QString::fromUtf8("# DR200/HE Holter 心電圖匯出\n")
+        << QString::fromUtf8("# 病患：") << m_ecg.patientId << "\n"
+        << QString::fromUtf8("# 日期：") << m_ecg.startDate << " " << m_ecg.startTime << "\n"
+        << QString::fromUtf8("# 序號：") << m_ecg.serialNumber << " " << m_ecg.firmware << "\n"
+        << QString::fromUtf8("# 取樣率：") << m_ecg.sampleRate << " Hz\n"
+        << QString::fromUtf8("# 通道數：") << m_ecg.numChannels << "\n"
+        << QString::fromUtf8("# 比例：12.5 uV/LSB，ADC 中心值 2048\n#\n");
 
-    out << "索引,時間(秒)";
+    out << QString::fromUtf8("索引,時間(秒)");
     for (int ch = 0; ch < m_ecg.numChannels; ch++)
         out << QString(",通道%1微伏,通道%1毫伏,通道%1電極脫落").arg(ch);
     out << "\n";
